@@ -156,7 +156,7 @@ public class SpellChecker {
     private final Lexicon dictionary = ...;
     
     private SpellChecker() {}
-    public nstatic SpellChecker INSTANCE = new SpellChecker(...);
+    public static SpellChecker INSTANCE = new SpellChecker(...);
     
     public static boolean isValid(String word) {};
     public static List<String> suggestions(String type) {};
@@ -222,7 +222,7 @@ static boolean isKoreanWord(String s) {
 
 ```java
 private static long sum() {
- 	Long sum = 0L;
+    Long sum = 0L;
     for (long i = 0; i <= Integer.MAX_VALUE; i++) {
         sum += i;
     }
