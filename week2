@@ -1,0 +1,716 @@
+# 아이템 8 Finalizer와 Cleaner는 피하라
+
+**Finalizer는 예측 불가능하고, 위험하며, 대부분 불필요하다.** 이상하게 동작하기도 하고, 성능도 안좋아지고, 이식성에도 문제가 생길 수 있다. Finalizer를 유용하게 쓸 수 있는 경우는 극히 드물다.
+
+일단 자바 9에서는 Finalizer가 deprecated 됐으면 `Cleaner`라는게 새로 생겨서 Finalizer 보다 덜 위험하지만(별도의 쓰레드를 사용하니까), **여전히 예측 불가능하며, 느리고, 일반적으로 불필요하다.**
+
+C++에서의 destructor랑은 다른거다. C++의 destructor는 어떤 객체와 연관이는 자원을 반납할 때도 사용하지만, 자바에서는 `try-with-resources`또는 `try-finally` 블럭이 그 역할을 한다.
+
+## 단점 1
+
+언제 실행될지 알 수 없다. 어떤 객체가 더이상 필요 없어진 시점에 그 즉시 finalizer 또는 cleaner가 바로 실행되지 않을 수도 있다. 그 사이에 시간이 얼마나 걸릴지는 아무도 모른다. 따라서 **타이밍이 중요한 작업을 절대로 finalizer나 cleaner에서 하면 안된다.** 예를 들어, 파일 리소스를 반납하는 작업을 그 안에서 처리한다면, 실제로 그 파일 리소스 처리가 언제 될지 알 수 없고, 자원 반납이 안되서 더이상 새로운 파일을 열 수 없는 상황이 발생할 수도 있다. (왜냐면 시스템이 동시에 열 수 있는 파일 개수에 한계가 있기 때문!)
+
+## 단점 2
+
+특히 Finalizer는 인스턴스 반납을 지연 시킬 수도 있다. Finalizer 쓰레드는 우선 순위가 낮아서 언제 실행될지 모른다. 따라서, Finalizer 안에 어떤 작업이 있고, 그 작업을 쓰레드가 처리 못해서 대기하고 있다면, 해당 인스턴스는 GC가 되지 않고 계속 쌓이다가 결국엔 OutOfMomoryException이 발생할 수도 있다.
+
+Clenaer는 별도의 쓰레드로 동작하니까 이 부분에 있어서 조금은 나을 수도 있지만 (해당 쓰레드의 우선순위를 높게 준더거나..), 여전히 해당 쓰레드는 백그라운드에서 동작하고 언제 처리될지는 알 수 없다.
+
+## 단점 3
+
+즉시 실행되지 않는 다는건 차치하고 Finalizer나 Cleaner는 아예 실행되지 않을 수도 있다. 따라서, **Finalizer나 Cleaner로 저장소 상태를 변경하는 일(상태를 영구적으로 수정하는 작업)을 하지 말라.** 데이터베이스 같은 자원의 락을 그것들로 반환하는 작업을 한다면 전체 분산 시스템이 멈춰 버릴 수도 있다.
+
+`System.gc`나 `System.runFinalization`에 속지 말라. 그걸 실행해도 Finalizer나 Cleaner를 바로 실행한다고 보장하진 못한다. 그걸 보장해주겠다고 만든 `ystem.runFinalizersOnExit`와 그 쌍둥이 `Runtime.runFinalizersOnExit`은 둘다 망했고 수십년간 deprecated 상태다.
+
+## 단점 4
+
+심각한 성능 문제도 있다. `AutoCloseable` 객체를 만들고, `try-with-resource`로 자원 반납을 하는데 걸리는 시간은 12ns 인데 반해, Finalizer를 사용한 경우에 550ns가 걸렸다. 약 50배가 걸렸다. Cleaner를 사용한 경우에는 66ns가 걸렸다 약 5배.
+
+## 단점 5
+
+Finalizer 공격이라는 심각한 보안 이슈에도 이용될 수 있다. 어떤 클래스가 있고 그 클래스를 공격하려는 클래스가 해당 클래스를 상속 받는다. 그리고 그 나쁜 클래스의 인스턴스를 생성하는 도중에 예외가 발생하거나, 직렬화 할 때 예외가 발생하면, 원래는 죽었어야 할 객체의 finalizer가 실행될 수 있다. 그럼 그 안에서 해당 인스턴스의 레퍼런스를 기록할 수도 있고, GC가 되지 못하게 할 수도 있다. 또한 그 안에서 인스턴스가 가진 메소드를 호출할 수도 있다.
+
+원래는 생성자에서 예외가 발생해서 존재하질 않았어야 하는 인스턴스인데, Finalizer 때문에 살아 남아 있는 것이다.
+
+Final 클래스는 상속이 안되니까 근본적으로 이런 공격이 막혀 있으며, 다른 클래스는 `finalize()` 메소드에 `final` 키워드를 사용해서 상속해서 오버라이딩 하는 것을 만을 수 있다.
+
+## 자원 반납 하는 방법
+
+자원 반납이 필요한 클래스 `AutoCloseable` 인터페이스를 구현하고 `try-with-resource`를 사용하거나, 클라이언트가 `close` 메소드를 명시적으로 호출하는게 정석이다. 여기서 추가로 언급하자면, `close` 메소드는 현재 인스턴스의 상태가 이미 종료된 상태인지 확인하고, 이미 반납이 끝난 상태에서 `close`가 다시 호출됐다면 `IllegalStateException`을 던져야 한다.
+
+## Finalizer와 Cleaner를 안전망으로 쓰기
+
+자원 반납에 쓸 `close` 메소드를 클라이언트가 호출하지 않았다는 가정하에, 물론 실제로 Finalizer나 Cleaner가 호출될지 안될지 언제 호출될지도 모르긴 하지만, 안하는 것 보다는 나으니까. 실제로 자바에서 제공하는 `FileInputStream`, `FileOutputStream`, `ThreadPoolExecutor` 그리고 `java.sql.Connection`에는 안전망으로 동작하는 finalizer가 있다.
+
+## 네이티브 피어 정리할 때 쓰기
+
+```
+자바 클래스 -> 네이티브 메소드 호출 -> 네이티브 객체 (네티이브 Peer)
+
+```
+
+네이티브 객체는 일반적인 객체가 아니라서 GC가 그 존재를 모른다. 네이티브 피어가 들고 있는 리소스가 중요하지 않은 자원이며, 성능상 영향이 크지 않다면 Cleaner나 Finalizer를 사용해서 해당 자원을 반납할 수도 있을 것이다. 하지만, 중요한 리소스인 경우에는 위에서 언급한대로 `close` 메소드를 사용하는게 좋다.
+
+## Cleaner 예제 코드
+
+```java
+public class CleanerSample implements AutoCloseable {
+
+    private static final Cleaner CLEANER = Cleaner.create();
+
+    private final CleanerRunner cleanerRunner;
+
+    private final Cleaner.Cleanable cleanable;
+
+    public CleanerSample() {
+        cleanerRunner = new CleanerRunner();
+        cleanable = CLEANER.register(this, cleanerRunner);
+    }
+
+    @Override
+    public void close() {
+        cleanable.clean();
+    }
+
+    public void doSomething() {
+
+        System.out.println("do it");
+    }
+
+    private static class CleanerRunner implements Runnable {
+
+        // TODO 여기에 정리할 리소스 전달
+
+        @Override
+        public void run() {
+            // 여기서 정리
+            System.out.printf("close");
+        }
+    }
+
+}
+
+```
+
+주의 할 점
+
+- Cleaner 쓰레드(`CleanerRunner`)는 정리할 대상인 인스턴스 (`CleanerSample`)을 참조하면 안된다. 순환 참조가 생겨서 GC 대상이 되질 못한다.
+- Cleaner 쓰레드를 만들 클래스는 반드시 static 클래스여야 한다. non-static 클래스(익명 클래스도 마찬가지)의 인스턴스는 그걸 감싸고 있는 클래스의 인스턴스를 참조하지 않는다.
+
+## 참고
+
+- [AutoCloseable](https://docs.oracle.com/javase/8/docs/api/java/lang/AutoCloseable.html)
+- [Try-With-Resource](https://docs.oracle.com/javase/tutorial/essential/exceptions/tryResourceClose.html)
+- [Cleaner](https://docs.oracle.com/javase/9/docs/api/java/lang/ref/Cleaner.html)
+- [Cleaner 예제](https://www.logicbig.com/tutorials/core-java-tutorial/gc/ref-cleaner.html)
+
+# 아이템 9 Try Finally 보다는 try-with-resources를 사용하라
+
+자바 라이브러리에는 `InputStream`, `OutputStream` 그리고 `ava.sql.Connection`과 같이 정리(close)가 가능한 리소스가 많은데, 그런 리소스를 사용하는 클라이언트 코드가 보통 리소스 정리를 잘 안하거나 잘못하는 경우가 있다.
+
+```java
+public class FirstError extends RuntimeException {
+}
+
+```
+
+```java
+public class SecondException extends RuntimeException {
+}
+
+```
+
+```java
+public class MyResource implements AutoCloseable {
+
+    public void doSomething() throws FirstError {
+        System.out.println("doing something");
+        throw new FirstError();
+    }
+
+    @Override
+    public void close() throws SecondException {
+        System.out.println("clean my resource");
+        throw new SecondException();
+    }
+}
+
+```
+
+```java
+MyResource myResource = null;
+try {
+    myResource = new MyResource();
+    myResource.doSomething();
+} finally {
+    if (myResource != null) {
+        myResource.close();
+    }
+}
+
+```
+
+이 코드에서 예외가 발생하면 `SecondException`이 출력되고 `FirstException`은 덮힌다. 즉 안 보인다. 그러면 문제를 디버깅하기 힘들어 진다. 또한 중복으로 try-catch를 만들어여 하는 경우에도 실수를 할 가능성이 높다. (자바 퍼즐러 88쪽 참고)
+
+자바7에 추가된 Try-with-Resource를 사용하면 코드 가독성도 좋고, 문제를 분석할 때도 훨씬 좋다. 왜냐면 Try-Finally를 사용할 때 처럼 처음에 발생한 예외가 뒤에 발생한 에러에 덮히지 않으니까.
+
+뒤에 발생한 에러는 첫번째 발생한 에러 뒤에다 쌓아두고(suppressed) 처음 발생한 에러를 중요시 여긴다. 그리고 `Throwable`의 `getSuppressed` 메소드를 사용해서 뒤에 쌓여있는 에러를 코딩으로 사용할 수도 있다.
+
+`catch` 블록은 Try-Fianlly와 동일하게 사용할 수 있다.
+
+
+# 아이템 10 equals는 일반 규약을 지켜 재정의 하라
+
+equals 메서드는 잘못 재정의하면 끔찍한 결과를 초래한다. 
+
+## equals를 재정의하면 안되는 경우
+
+1. **각 인스턴스가 본질적으로 고유할 때**
+값 클래스(`Integer`나 `String`처럼 값을 표현하는 클래스)가 아닌 동작하는 개체를 표현하는 클래스
+ex) `Thread`
+2. **인스턴스의 '논리적 통치성'을 검사할 일이 없을 때**ex) `java.util.regax.Pattern`은 `equals`를 재정의해 두 `Pattern`의 정규표현식을 비교
+3. **상위 클래스에서 재정의한 `equals`가 하위 클래스에도 딱 들어맞을 때**ex) `Set`은 `AbstractSet`이 구현한 `equals`를 상속, `List`는 `AbstractList`, `Map`은 `AbstractMap`
+4. **클래스가 *private*이나 *package-private*이고 `equals`를 호출할 일이 없을 때**
+ `equals`가 실수로라도 호출되는 걸 막기 위해서는 아래와 같이 코드를 짜면 된다. 
+
+    
+    ```java
+    @Override public boolean equals(Object o) {
+    	throw new AssertionError(); // 호출 금지!
+    }
+    ```
+    
+
+## equals를 재정의해야 하는 경우
+
+1. **상위 클래스의 equals가 논리적 동치성을 비교하도록 재정의되지 않았을 경우**
+- 주로 값 클래스(int나 String 처럼 값을 표현하는 클래스)가 해당됨
+2. **인스턴스 통제클래스일 경우** 
+(같은 인스턴스가 둘 이상 만들어지지 않음을 보장)
+- 어차피 논리적으로 같은 인스턴스가 2개이상 만들어지지 않으므로 논리적 동치성, 객체 식별성이 같은 의미가 됨
+
+## equals 메서드 재정의 일반 규약: 동치관계
+
+**동치 클래스(equivalent class): 집합을 서로 같은 원소들로 이루어진 부분집합으로 나누는 연산**→ `equals` 메서드가 쓸모 있으려면 모든 원소가 같은 동치류에 속한 어떤 원소와도 교환이 가능해야 한다.
+
+- **반사성(reflexivity)**: `null`이 아닌 모든 참조 값 x에 대해, `x.equals(x)`는 `true`다.
+- **대칭성(symmetry)**: `null`이 아닌 모든 참조 값 x, y에 대해, `x.equals(y)`가 `true`면 `y.equals(x)`도 `true`다.
+- **추이성(transitivity)**: `null`이 아닌 모든 참조 값 x, y, z에 대해, `x.equals(y)`가 `true`이고, `y.equals(z)`도 `true`면 `x.equals(z)`도 `true`다.
+- **일관성(consistency)**: `null`이 아닌 모든 참조 값 x, y에 대해, `x.equals(y)`를 반복해서 호출하면 항상 `true`이거나 `false`다.
+- `*null`아님**: `null`이 아닌 모든 참조 값 x에 대해, `x.equals(null)`은 `false`다.
+
+### **반사성(reflexivity)**
+
+> 객체가 자기 자신과 같아야 한다.
+> 
+
+```java
+public class ProgrammingLanguage{
+  private String name;
+
+  public Fruit(String name){
+    this.name = name;
+  }
+
+  public static void main(){
+    Set<ProgrammingLanguage> set = new HashSet<>();
+    ProgrammingLanguage language = new ProgrammingLanguage("java");
+    set.add(language);
+    System.out.println(set.contains(language)); // false일 경우, 반사성을 만족하지 못하는 경우이다.
+  }
+}
+```
+
+### **대칭성(symmetry)**
+
+> 두 객체는 서로에 대한 동치 여부에 똑같이 답해야 한다.
+> 
+
+### **잘못된 코드 - 대칭성 위배!**
+
+```java
+// 대칭성을 위반한 클래스
+public final class CaseInsensitiveString{
+  private final String s;
+
+  public CaseInsensitiveString(String s){
+    this.s = Obejcts.requireNonNull(s);
+  }
+
+  // 대칭성 위배!
+  @Override public boolean equals(Object o){
+    if(o instanceof CaseInsensitiveString)
+      return s.equalsIgnoreCase(((CaseInsensitiveString) o).s);
+    if(o instanceof String) // 한방향으로만 작동한다.
+      return s.equalsIgnoreCase((String) o);
+    return false;
+  }
+}
+```
+
+문제는 `CaseInsensitiveString`의 `equals`는 `String`을 알고 있지만, `String`의 `equals`는 `CaseInsensitiveString`의 존재를 모른다는 데 있다. 대칭성을 명백히 위반한다.
+
+```java
+CaseInsensitiveString cis = new CaseInsensitiveString("Polish");
+String s = "polish";
+
+cis.equals(s); // true
+s.equals(cis); // false
+```
+
+### **해결 - `CaseInsensitiveString`끼리만 비교하도록 한다.**
+
+```java
+//대칭성을 만족하게 수정
+@Override public boolean equals(Object o){
+  return o instanceof CaseInsensitiveString && ((CaseInsensitiveString) o).s.equalsIgnoreCase(s); 
+}
+```
+
+### **추이성(transitivity)**
+
+> 첫 번째 객체와 두 번째 객체가 같고, 두 번째 객체와 세 번째 객체가 같아면, 첫 번째 객체와 세 번째 객체도 같아야 한다.
+> 
+
+상위 클래스에 없는 새로운 필드를 하위 클래스에 추가하며 `equals`를 재정의할 때 자주 발생하는 문제다.
+
+```java
+public class Point {
+	private final int x;
+	private final int y;
+
+	public Point(int x, int y) {
+		this.x = x;
+		this.y = y;
+	}
+
+	@Override public boolean equals(Object o) {
+		if(!o instanceof Point)
+			return false;
+		Point p = (Point) o;
+		return p.x == x && p.y == y;
+	}
+}
+```
+
+```java
+public class ColorPoint extends Point {
+	private final Color color;
+	
+	public ColorPoint(int x, int y, Color color) {
+		super(x, y);
+		this.color = color;
+	}
+
+	...
+}
+```
+
+### **1. 잘못된 코드 - 대칭성 위배!**
+
+```java
+    @Override public boolean equals(Object o) {
+    	if(!o instanceof ColorPoint)
+    		return false;
+    	return super.equals(o) && ((ColorPoint) o).color == color;
+    }
+```
+
+```java
+    public static void main(){
+      Point p = new Point(1,2);
+      ColorPoint cp = new ColorPoint(1,2, Color.RED);
+      p.equals(cp);    // true
+      cp.equals(p);    // false
+    }
+```
+
+`ColorPoint`의 `equals`는 입력 매개변수의 클래스 종류가 다르다며 매번 `false`만 반환할 것이다.
+
+### **2. 잘못된 코드 - 추이성 위배!**
+
+```java
+    @Override public boolean equals(Obejct o){
+      if(!(o instanceof Point))
+        return false;
+      if(!(o instanceof ColorPoint))
+        return o.equals(this);
+      return super.equals(o) && ((ColorPoint) o).color == color;
+    }
+```
+
+```java
+    public static void main(){
+      ColorPoint p1 = new ColorPoint(1,2, Color.RED);
+      Point p2 = new Point(1,2);
+      ColorPoint p3 = new ColorPoint(1,2, Color.BLUE);
+      p1.equals(p2);    // true 
+      p2.equals(p3);    // true 
+      p1.equals(p3);    // false
+    }
+```
+
+`p1.equals(p2);`와 `p2.equals(p3);`는 `true`를 반환하는데, `p1.equals(p3);`는 `false`를 반환해 추이성에 위배된다.이 방식은 **무한 재귀**에 빠질 위험도 있다.
+
+```java
+    //SmellPoint.java의 equals
+    @Override public boolean equals(Obejct o){
+      if(!(o instanceof Point))
+        return false;
+      if(!(o instanceof SmellPoint))
+        return o.equals(this);
+      return super.equals(o) && ((SmellPoint) o).color == color;
+    }
+```
+
+```java
+    public static void main(){
+      ColorPoint p1 = new ColorPoint(1,2, Color.RED);
+      SmellPoint p2 = new SmellPoint(1,2);
+      p1.equals(p2);
+      // 1. ColorPoint의 equals: 2번째 if문 때문에 SmellPoint의 equals로 비교
+      // 2. SmellPoint의 equals: 2번째 if문 때문에 ColorPoint의 equals로 비교
+      // 3. 1~2 무한 재귀로 인한 StackOverflow Error
+    }
+```
+
+구체 클래스를 확장해 새로운 값을 추가하면서 `equals` 규약을 만족시킬 방법은 존재하지 않는다.
+
+### **3. 잘못된 코드 - 리스코프 치환 원칙 위배!**
+
+그렇다고 `instanceof` 검사 대신 `getClass` 검사를 하라는 것은 아니다.
+
+```java
+    @Override public boolean equals(Object o){
+      if(o == null || o.getClass() != getClass())
+        return false;
+      Point p = (Point) o;
+      return p.x == x && p.y == y;
+    }
+```
+
+위의 코드는 같은 구현 클래스의 객체와 비교할 때만 `true`를 반환한다.리스코프 치환 원칙: 어떤 타입에 있어 중요한 속성이라면 그 하위 타입에서도 마찬가지로 중요하다.= `Point`의 하위 클래스는 여전히 `Point`이므로 어디서든 `Point`로써 활용될 수 있어야 한다.
+
+**해결 1 - 상속 대신 컴포지션을 사용하라 (`equals` 규약을 지키면서 값 추가하기)**
+
+```java
+public class ColorPoint{
+  private final Point point;
+  private final Color color;
+
+	public ColorPoint(int x, int y, Color color) {
+		point = new Point(x, y);
+		this.color = Objects.requireNonNull(color);
+	}
+
+	/* 이 ColorPoint의 Point 뷰를 반환한다. */
+  public Point asPoint(){ // view 메서드 패턴
+    return point;
+  }
+
+  @Override public boolean equals(Object o){
+    if(!(o instanceof ColorPoint)){
+      return false;
+    }
+    ColorPoint cp = (ColorPoint) o;
+    return cp.point.equals(point) && cp.color.equals(color);
+  }
+}
+```
+
+> 컴포지션: 기존 클래스가 새로운 클래스의 구성 요소로 쓰인다.기존 클래스를 확장하는 대신, 새로운 클래스를 만들고 private 필드로 기존 클래스의 인스턴스를 참조하게 한다.컴포지션을 통해 새 클래스의 인스턴스 메서드들은 기존 클래스에 대응하는 메서드를 호출해 그 결과를 반환한다.
+> 
+
+`Point`를 상속하는 대신 `Point`를 `ColorPoint`의 *private* 필드로 두고, `ColorPoint`와 같은 위치의 일반 `Point`를 반환하는 뷰(view 메서드)를 *public*으로 추가하는 식이다.
+
+- `ColorPoint` vs. `ColorPoint`: `ColorPoint`의 `equals`를 이용하여 color값까지 모두 비교
+- `ColorPoint` vs. `Point`: `ColorPoint`의 `asPoint`를 이용하여 `Point`로 바꿔, `Point`의 `equals`를 이용해 x, y비교
+- `Point` vs. `Point`: `Point`의 `equals`를 이용해 x, y값 모두 비교
+
+ex) `java.sql.Timestamp`: `java.util.Date` 확장 후 `nanoseconds` 필드 추가.→ `Timestamp`의 `equals`는 대칭성을 위배하며, `Date`와 섞어 쓸 때 엉뚱하게 동작할 수 있다.
+
+**해결 2 - 추상 클래스의 하위 클래스 사용하기**
+
+추상 클래스의 하위 클래스에서는 `equals` 규약을 지키면서도 값을 추가할 수 있다.상위 클래스의 인스턴스를 직접 만드는 게 불가능하기 때문에, 하위 클래스끼리의 비교가 가능하다.
+
+### **일관성(consistency)**
+
+> 두 객체가 같다면 (어느 하나 혹은 두 객체 모두가 수정되지 않는 한) 앞으로도 영원히 같아야 한다.
+> 
+- 가변 객체의 경우 비교 시점에 따라 서로 다를 수도 혹은 같을 수도 있다.
+- 불변 객체는 한번 다르면 끝까지 달라야 한다.
+- 클래스가 불변이든 가변이든 `equals`의 판단에 신뢰할 수 없는 자원이 끼어들게 해서는 안 된다.ex) `java.net.URL`의 `equals`는 주어진 URL과 매핑된 호스트의 IP주소를 이용해 비교하는데,호스트 이름을 IP주소로 바꾸려면 네트워크를 통해야 하므로 그 결과가 항상 같다고 보장할 수 없다.→ `equals`는 항시 메모리에 존재하는 객체만을 사용한 결정적(deterministic) 계산만 수행해야 한다.
+
+### **null-아님**
+
+모든 객체가 `null`과 같지 않아야 한다.
+
+**잘못된 명시적 null 검사**
+
+```java
+@Override
+public boolean equals(Object o) {
+  if(o == null) { 
+      return false;
+  }
+}
+```
+
+**올바른 묵시적 null 검사 - 이쪽이 낫다.**
+
+```java
+@Override
+public boolean equals(Object o) {
+  if(!(o instanceof MyType)) { 
+      return false;
+  }
+  MyType myType = (MyType) o;
+}
+```
+
+동시성을 검사하려면 `equals`는 건네받은 객체를 적절히 형변환한 후 필수 필드들의 값을 알아내야 한다.따라서, 형변환에 앞서 `instanceof` 연산자로 입력 매개변수가 올바른 타입인지 검사해야 한다.입력이 `null`이면 타입 확인 단계에서 `false`를 반환하므로 `null` 검사를 명시적으로 하지 않아도 된다.
+
+## **정리: 양질의 `equals` 메서드 구현 방법**
+
+1. `==`연산자를 사용해 입력이 자기 자신의 참조인지 확인한다.자기 자신이면 `true`를 반환한다. 단순한 성능 최적화용으로 비교 작업이 복잡한 상황일 때 값어치를 한다.
+2. `instanceof` 연산자로 입력이 올바른 타입인지 확인한다.가끔 해당 클래스가 구현한 특정 인터페이스를 비교할 수도 있다.이런 인터페이스를 구현한 클래스라면 `equals`에서 (클래스가 아닌) 해당 인터페이스를 사용해야한다.ex) `Set`, `List`, `Map`, `Map.Entry` 등 컬렉션 인터페이스들
+3. 입력을 올바른 타입으로 형변환 한다.2번에서 `instanceof` 연산자로 입력이 올바른 타입인지 검사 했기 때문에 이 단계는 100% 성공한다.
+4. 입력 객체와 자기 자신의 대응되는 '핵심' 필드들이 모두 일치하는지 하나씩 검사한다.모두 일치해야 `true`를 반환한다.
+
+## equals **구현 시 주의할 추가 사항**
+
+- **기본 타입**: `==` 연산자 비교
+- **참조 타입**: `equals` 메서드로 비교
+- **float, double 필드**: 정적 메서드 `Float.compare(float, float)`와 `Double.compare(double, double)`로 비교`Float.equals(float)`나 `Double.equals(double)`은 오토 박싱을 수반해 성능상 좋지 않다.
+- **배열 필드**: 원소 각각을 지침대로 비교한다. 모두가 핵심 필드라면 `Arrays.equals()`를 사용한다.
+- **null 정상값 취급 방지**: `Object.equals(object, object)`로 비교하여 `NullPointException` 발생을 예방한다.
+- 비교하기 **복잡한 필드를 가진 클래스**: 필드의 표준형(canonical form)을 저장한 후 표준형끼리 비교
+- **필드의 비교 순서는 `equals` 성능을 좌우한다.**: 다를 가능성이 크거나 비교하는 비용이 싼 필드부터 비교파생 필드가 객체 전체 상태를 대표하는 경우, 파생 필드부터 비교
+- `*equals`를 재정의할 땐 `hashCode`도 반드시 재정의하자**
+- **너무 복잡하게 해결하려 들지 말자.**
+- **Object 외의 타입을 매개변수로 받는 `equals` 메서드는 선언하지 말자.**`public boolean equals(MyClass o)`: 입력 타입이 Object가 아니므로 오버로딩한 것이다.
+
+### **잘 구현된 예**
+
+```java
+public class PhoneNumber {
+    private final short areaCode, prefix, lineNum;
+
+    public PhoneNumber(int areaCode, int prefix, int lineNum) {
+        this.areaCode = rangeCheck(areaCode, 999, "지역코드");
+        this.prefix = rangeCheck(prefix, 999, "프리픽스");
+        this.lineNum = rangeCheck(lineNum, 9999, "가입자 번호");
+    }
+
+    private static short rangeCheck(int val, int max, String arg) {
+        if(val < 0 || val > max) {
+            throw new IllegalArgumentException(arg + ": " + val);
+        }
+        return (short) val;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if(o == this) {
+            return true;
+        }
+
+        if(!(o instanceof PhoneNumber)) {
+            return false;
+        }
+
+        PhoneNumber pn = (PhoneNumber) o;
+        return pn.lineNum == lineNum && pn.prefix == prefix
+                && pn.areaCode == areaCode;
+    }
+}
+```
+
+## **`AutoValue` 프레임워크**
+
+`equals`(`hashCode`도 마찬가지)를 작성하고 테스트하는 작업을 대신해줄 오픈 소스.클래스에 애너테이션 하나만 추가하면 AutoValue가 이 메서드들을 알아서 작성해준다.
+
+## **결론**
+
+꼭 필요한 경우가 아니면 `equals`를 재정의하지 말자. 많은 경우에 `Object`의 `equals`가 여러분이 원하는 비교를 정확히 수행해준다. 재정의해야 할 때는 그 클래스의 핵심 필드 모두를 빠짐없이, 다섯 가지 규약을 확실히 지켜가며 비교해야 한다.
+
+##
+
+# 아이템 11 equals를 재정의하려거든 hashCode도 재정의하라
+
+**equals를 재정의한 클래스는 hashcode도 재정의 해야 한다.**
+
+그렇지 않으면 인스턴스를 HashMap이나 HashSet 같은 컬렉션의 원소로 사용할 때 문제가 발생한다.
+
+## HashCode 일반 규약
+
+- **equals 비교에 사용되는 정보가 변경되지 않았다면, hashcode도 변하면 안 된다.**
+(애플리케이션을 다시 실행한다면 이 값이 달라져도 상관 없음)
+- **`equals`가 두 객체가 같다고 판단했다면, 두 객체의 `hashCode`는 똑같은 값을 반환한다.**
+→ 논리적으로 같은 객체는 같은 해시코드를 반환해야 한다.
+- **`equals`가 두 객체를 다르다고 판단했더라도, `hashCode`는 꼭 다를 필요는 없다.**
+하지만, 다른 객체에 대해서는 다른 값을 반환해야 해시테이블의 성능이 좋아진다.
+
+## 논리적으로 같은 객체는 같은 해시코드를 반환해야 한다.
+
+`equals`가 물리적으로 다른 두 객체를 논리적으로 같다고 할 때, `hashCode`는 서로 다른 값을 반환한다.
+
+```java
+Map<PhoneNumber, String> map = new HashMap<>();
+map.put(new PhoneNumber(010,1234,5678), new Person("리치"));
+
+```
+
+이 코드에 `map.get(new PhoneNumber(010,1234,5678))`를 실행하면 `"리치"`가 아닌 `null`을 반환한다.
+
+`PhoneNumber` 클래스는 `hashCode`를 재정의하지 않았기 때문에, 논리적 동치인 두 객체가 서로 다른 해시코드를 반환하여 `get` 메서드는 엉뚱한 해시 버킷에 가서 객체를 찾으려 한 것이다.
+
+**`HashMap`은 해시코드가 서로 다른 엔트리끼리는 동치성 비교를 시도조차 않도록 최적화 되어있다.**
+
+### 동치인 모든 객체에서 똑같은 hashCode를 반환하는 코드
+
+```java
+@Override
+	public int hashCode() {
+		return 42;
+	}
+
+```
+
+안 된다. 모든 객체에게 똑같은 값만 내어주므로 모든 객체가 해시테이블의 버킷 하나에 담겨 마치 연결리스트처럼 동작한다. 그 결과 평균 수행 시간이 O(1)인 해시테이블이 O(n)으로 느려져서, 도저히 쓸 수 없게 된다.
+
+## 좋은 해시 함수라면 서로 다른 인스턴스에 다른 해시코드를 반환한다.
+
+### 좋은 `hashCode`를 작성하는 요령
+
+1. int 변수인 `result`를 선언한 후 값을 c로 초기화한다.
+    - 이 때, c는 해당 객체의 첫번째 핵심 필드를 단계 2.1 방식으로 계산한 해시코드이다.
+    - 여기서 핵심 필드는 `equals` 비교에 사용되는 필드를 말한다.
+2. 해당 객체의 나머지 핵심 필드인 f 각각에 대해 다음 작업을 수행한다.
+    1. 해당 필드의 해시코드 c 를 계산한다.
+        - 기본 타입 필드라면, `Type.hashCode(f)`를 수행한다. 여기서 *Type*은 해당 기본타입의 박싱 클래스다.
+        - 참조 타입 필드면서, 이 클래스의 `equals` 메소드가 이 필드의 `equals`를 재귀적으로 호출하여 비교한다면, 이 필드의 `hashCode`를 재귀적으로 호출한다.
+        - 필드가 배열이라면, 핵심 원소 각각을 별도 필드처럼 다룬다.
+        모든 원소가 핵심 원소라면 `Arrays.hashCode`를 사용한다.
+    2. 단계 2.1에서 계산한 해시코드 c로 `result`를 갱신한다.
+        - `result` = 31 * `result` + c;
+3. `result`를 반환한다.
+
+### 주의할 점
+
+- `equals`비교에 사용되는 필드에 대해서만 해시코드를 계산한다.
+- 성능을 높인답시고 해시코드를 계산할 때 핵심 필드를 생략해서는 안 된다.
+- 만약 hash로 바꾸려는 필드가 기본 타입이 아니면 해당 필드의 hashCode를 불러 구현한다.
+계산이 복잡한 경우는 표준형을 만들어 구현한다.
+- 참조 타입 필드가 null일 경우 0을 사용.
+- 31을 곱하는 이유는 비슷한 필드가 여러개일 때 해시효과를 크게 높여주기 위해서다.
+비슷한 값들이 여러개 있을때 그냥 더하면 같은 값이 나올 확률이 높다.
+그래서 31을 곱해 큰수로 만들어 해시효과를 증가시킨다.
+
+### 전형적인 `hashCode` 메서드
+
+```java
+@Override
+    public int hashCode() {
+        int result = Integer.hashCode(areaCode);
+        result = 31 * result + Integer.hashCode(prefix);
+        result = 31 * result + Integer.hashCode(lineNum);
+        return result;
+    }
+
+```
+
+`PhoneNumber` 인스턴스의 핵심 필드 3개를 사용해 간단한 계산을 수행하고, 이 과정에 비결정적 요소는 없다.
+→ 동치인 `PhoneNumber` 인스턴스는 서로 같은 해시코드를 가질 것이 확실하다.
+
+### `Objects` 클래스의 `hashCode` 메서드 - 성능이 살짝 아쉽다.
+
+```java
+@Override
+    public int hashCode() {
+        return Objects.hash(lineNum,prefix,areaCode);
+    }
+
+```
+
+입력 인수를 담기 위한 배열이 만들어지고, 입력 중 기본 타입이 있다면 박싱과 언박싱도 거친다. 속도가 느리다.
+
+## `hashCode`의 캐싱과 지연 초기화
+
+- 클래스가 불변이고 해시코드를 계산하는 비용이 크다면, 매번 새로 계산하기 보다 캐싱을 고려해야 한다.
+→ 이 타입의 객체가 주로 해시의 키로 사용될 것 같다면 인스턴스가 만들어질 때 해시코드를 계산해 둔다.
+- 해시의 키로 사용되지 않는 경우라면 `hashCode`가 처음 불릴 때 계산한느 지연 초기화하면 좋다.
+→ 필드를 지연 초기화 하려면 그 클래스가 *thread-safe*가 되도록 동기화에 신경 쓰는 것이 좋다.
+
+### 해시코드를 지연 초기화하는 `hashCode` 메서드 - 스레드 안전성까지 고려해야 한다.
+
+```java
+private int hashCode;
+
+@Override
+public int hashCode() {
+      	int result = hashCode; // 초기값 0을 가진다.
+        if(result == 0) {
+        int result = Integer.hashCode(areaCode);
+        result = 31 * result + Integer.hashCode(areaCode);
+        result = 31 * result + Integer.hashCode(areaCode);
+        hashCode = result;
+        }
+        return result;
+}
+
+```
+
+동시에 여러 쓰레드가 hashCode를 호출하면 여러 쓰레드가 동시에 계산하여 우리의 처음 의도와는 다르게 여러번 계산하는 상황이 발생할 수 있다.
+그래서 지연 초기화를 하려면 동기화를 신경써주는 것이 좋다.
+
+## 결론
+
+`equals`를 재정의할 때는 `hashCode`도 반드시 재정의해야 한다. 그렇지 않으면 프로그램이 제대로 동작하지 않을 것이다.
+재정의한 `hashCode`는 `Object`의 API 문서에 기술된 일반 규약을 따라야 하며, 서로 다른 인스턴스라면 되도록 해시코드도 서로 다르게 구현해야 한다. AutoValue 프레임워클르 사용하면 멋진 `equals`와 `hashCode`를 자동으로 만들어준다.
+
+
+# 아이템 12 toString을 항상 재정의하라
+
+왜?
+
+toString의 규약에서는 메서드를 사용할 때 재정의를 권장하고 있다. 
+
+1. toString을 잘 구현한 클래스는 사용하기에 훨씬 즐겁고 **그 클래스를 사용한 시스템은 디버깅하기 쉽다**. 
+2. 재정의를 제대로 하지 않으면 디버거가 객체를 출력할 때 엉뚱한 메세지만 로그에 남게 된다. 
+3. toString은 그 객체가 가진 주요 정보 모두를 반환하는 게 좋다.
+- 정보가 방대한 상황이면 요약정보를 담아야 한다. 
+
+## 반환값을 포맷을 문서화할지 정하라
+
+값 클래스라면 문서화하는 것이 낫다. 
+
+**포맷을 명시할 때**
+
+1. 그 객체는 표준적이고, 명확하고, 사람이 읽을 수 있는 데이터 객체로 저장된다. 
+2. 명시한 포맷과 맞는 문자열과 객체를 상호 전환할 수 있는 정적 팩터리나 생성자를 함께 제공하라.
+3. ex) BigInteger, BigDecimal
+4. 포맷을 한번 명시하면 평생 그 포맷에 얽매이게 된다. 
+
+**포맷을 명시하든 하지 않든 의도를 명확히 밝혀라.**
+
+```java
+    /**
+     * 이 전화번호의 문자열 표현을 반환한다.
+     * 이 문자열은 "XXX-YYY-ZZZZ" 형태의 12글자로 구성된다.
+     * XXX는 지역 코드, YYY는 프리픽스, ZZZZ는 가입자 번호다.
+     * 각각의 대문자는 10진수 숫자 하나를 나타낸다.
+     *
+     * 전화번호의 각 부분의 값이 너무 작아서 자릿수를 채울 수 없다면,
+     * 앞에서부터 0으로 채워나간다. 예컨대 가입자 번호가 123이라면
+     * 전화번호의 마지막 네 문자는 "0123"이 된다.
+     */
+    @Override public String toString() {
+        return String.format("%03d-%03d-%04d",
+                areaCode, prefix, lineNum);
+    }
+```
+
+포맷을 명시하지 않았을 경우의 예시이다. 
+
+**포맷여부에 상관없이 toString이 반환한 값에 포함된 정보를 얻어올 수 있는 API를 제공하라.**
